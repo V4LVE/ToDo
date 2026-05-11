@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/joho/godotenv"
@@ -21,50 +22,59 @@ type Todo struct {
 }
 
 var collection *mongo.Collection
+var memoryTodos []Todo
+var memoryMu sync.Mutex
 
 func main() {
-	fmt.Println("We're live")
-
 	err := godotenv.Load(".env")
 	if err != nil {
-		log.Fatal("Error loading env file: " + err.Error())
+		log.Println("No .env file found, falling back to environment variables")
 	}
-
+	fmt.Println("Starting server...")
+	fmt.Println("Attempting to connect to MongoDB Atlas...")
 	dbconstring := os.Getenv("dbconstring")
-	clientOptions := options.Client().ApplyURI(dbconstring)
-	client, err := mongo.Connect(context.Background(), clientOptions) // Implement cancelation token and timeout later
-
-	if err != nil {
-		log.Fatal("Something went wrong connecting to the database " + err.Error())
+	if dbconstring != "" {
+		clientOptions := options.Client().ApplyURI(dbconstring)
+		client, err := mongo.Connect(context.Background(), clientOptions)
+		if err != nil {
+			log.Println("Database unavailable, using in-memory todo store:", err)
+		} else if err := client.Ping(context.Background(), nil); err != nil {
+			log.Println("Database unavailable, using in-memory todo store:", err)
+			_ = client.Disconnect(context.Background())
+		} else {
+			defer client.Disconnect(context.Background())
+			fmt.Println("Connected to MongoDB Atlas")
+			collection = client.Database("golang_db").Collection("todos")
+		}
+	} else {
+		log.Println("dbconstring not set, using in-memory todo store")
 	}
-
-	defer client.Disconnect(context.Background())
-
-	err = client.Ping(context.Background(), nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("Connected to MongoDB Atlas")
-
-	collection = client.Database("golang_db").Collection("todos")
 
 	app := fiber.New()
 
 	app.Get("/api/todos", getTodos)
 	app.Patch("/api/todo/markdone/:id", markDone)
+	app.Patch("/api/todo/update/:id", updateTodo)
 	app.Post("/api/todo/create", createTodo)
 	app.Delete("/api/todo/delete/:id", deleteTodo)
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "4000"
+		port = "3000"
 	}
 
 	log.Fatal(app.Listen("0.0.0.0:" + port))
+	fmt.Println("We're live")
 }
 
 func getTodos(c *fiber.Ctx) error {
+	if collection == nil {
+		memoryMu.Lock()
+		defer memoryMu.Unlock()
+
+		return c.JSON(memoryTodos)
+	}
+
 	var todos []Todo
 
 	cursor, err := collection.Find(context.Background(), bson.M{})
@@ -94,6 +104,20 @@ func markDone(c *fiber.Ctx) error {
 		return err
 	}
 
+	if collection == nil {
+		memoryMu.Lock()
+		defer memoryMu.Unlock()
+
+		for index := range memoryTodos {
+			if memoryTodos[index].ID == objectID {
+				memoryTodos[index].Completed = true
+				return c.Status(200).JSON(fiber.Map{"success": true})
+			}
+		}
+
+		return c.Status(404).JSON(fiber.Map{"error": "todo not found"})
+	}
+
 	filter := bson.M{"_id": objectID}
 	update := bson.M{"$set": bson.M{"completed": true}}
 
@@ -106,6 +130,56 @@ func markDone(c *fiber.Ctx) error {
 	return c.Status(200).JSON(fiber.Map{"success": true})
 }
 
+func updateTodo(c *fiber.Ctx) error {
+	id := c.Params("id")
+	objectID, err := primitive.ObjectIDFromHex(id)
+
+	if err != nil {
+		return err
+	}
+
+	todo := new(Todo)
+
+	if err := c.BodyParser(todo); err != nil {
+		return err
+	}
+
+	if todo.Body == "" {
+		return c.Status(400).JSON(fiber.Map{"Error": "Body cannot be empty"})
+	}
+
+	if collection == nil {
+		memoryMu.Lock()
+		defer memoryMu.Unlock()
+
+		for index := range memoryTodos {
+			if memoryTodos[index].ID == objectID {
+				memoryTodos[index].Body = todo.Body
+				memoryTodos[index].Completed = todo.Completed
+				return c.Status(200).JSON(memoryTodos[index])
+			}
+		}
+
+		return c.Status(404).JSON(fiber.Map{"error": "todo not found"})
+	}
+
+	filter := bson.M{"_id": objectID}
+	update := bson.M{"$set": bson.M{"body": todo.Body, "completed": todo.Completed}}
+
+	_, err = collection.UpdateOne(context.Background(), filter, update)
+
+	if err != nil {
+		return err
+	}
+
+	var updated Todo
+	if err := collection.FindOne(context.Background(), filter).Decode(&updated); err != nil {
+		return err
+	}
+
+	return c.Status(200).JSON(updated)
+}
+
 func createTodo(c *fiber.Ctx) error {
 	todo := new(Todo)
 
@@ -115,6 +189,15 @@ func createTodo(c *fiber.Ctx) error {
 
 	if todo.Body == "" {
 		return c.Status(400).JSON(fiber.Map{"Error": "Body cannot be empty"})
+	}
+
+	if collection == nil {
+		todo.ID = primitive.NewObjectID()
+		memoryMu.Lock()
+		memoryTodos = append([]Todo{*todo}, memoryTodos...)
+		memoryMu.Unlock()
+
+		return c.Status(201).JSON(todo)
 	}
 
 	insertResult, err := collection.InsertOne(context.Background(), todo)
@@ -135,6 +218,20 @@ func deleteTodo(c *fiber.Ctx) error {
 		return err
 	}
 
+	if collection == nil {
+		memoryMu.Lock()
+		defer memoryMu.Unlock()
+
+		for index := range memoryTodos {
+			if memoryTodos[index].ID == objectID {
+				memoryTodos = append(memoryTodos[:index], memoryTodos[index+1:]...)
+				return c.SendStatus(204)
+			}
+		}
+
+		return c.Status(404).JSON(fiber.Map{"error": "todo not found"})
+	}
+
 	filter := bson.M{"_id": objectID}
 
 	_, err = collection.DeleteOne(context.Background(), filter)
@@ -143,5 +240,5 @@ func deleteTodo(c *fiber.Ctx) error {
 		return err
 	}
 
-	return c.Status(204).JSON(fiber.Map{"deleted": true})
+	return c.SendStatus(204)
 }
