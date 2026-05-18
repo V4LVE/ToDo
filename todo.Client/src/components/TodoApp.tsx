@@ -57,10 +57,10 @@ export default function TodoApp() {
       <div className="max-w-3xl mx-auto px-4">
         <header className="mb-8 text-center">
           <h1 className="text-4xl font-semibold text-slate-900 dark:text-slate-100">
-            Sleek Todos
+            Go Todos
           </h1>
           <p className="text-sm text-slate-600 dark:text-slate-300 mt-2">
-            Create, update, delete and mark tasks as done — powered by your Go
+            Create, update, delete and mark tasks as done — powered by Go
             backend.
           </p>
         </header>
